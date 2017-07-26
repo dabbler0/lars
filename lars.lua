@@ -27,26 +27,38 @@ local dist_mask = torch.CudaByteTensor()
 local active_mask = torch.CudaByteTensor()
 local Xa = torch.CudaTensor()
 
+local X = torch.CudaTensor()
+local Y = torch.CudaTensor()
+
 local bias_term = torch.CudaTensor()
 
 -- "Closeness" values
 local lambda = 1 - 1e-10
 local epsilon = 1e-2
 
-function lars(X, Y, total_weight, model_select, lasso_path)
+function lars(X_in, Y_in, total_weight, model_select, lasso_path)
+  X:resizeAs(X_in):copy(X_in)
+  Y:resizeAs(Y_in):copy(Y_in)
+
   local samples = X:size(1)
   local inputs = X:size(2)
   local recovering = false
 
+  --[[
   -- Normalize X:
   X_mean:resize(inputs):mean(X, 1)
+  print(X_mean)
   X:csub(X_mean:view(1, inputs):expandAs(X))
+  ]]
   X_stdev:resize(inputs):std(X, 1)
   X:cdiv(X_stdev:view(1, inputs):expandAs(X))
 
   -- Normalize Y:
+  --[[
   Y_mean:resize(1):mean(Y, 1)
+  print(Y_mean)
   Y:csub(Y_mean:resize(1, 1):expandAs(Y))
+  ]]
 
   -- Get covariances; this will have size (inputs) x 1
   c:resize(inputs, 1):zero()
@@ -81,7 +93,7 @@ function lars(X, Y, total_weight, model_select, lasso_path)
     end
   end
 
-  while #active ~= inputs do
+  while cabs:sum() > epsilon * inputs do
     csign:copy(c):sign()
 
     -- Select the active columns of the inputs matrix
@@ -121,50 +133,52 @@ function lars(X, Y, total_weight, model_select, lasso_path)
     dist_negative_denominator:copy(a):csub(A)
     dist_negative:cdiv(dist_negative_denominator)
 
-    local gamma = math.huge
-    local new_index = -1
-    for i=1,inputs do
-      if recovering or active_mask[i] == 0 then
-        if dist_positive[i][1] > 0 and dist_positive[i][1] < gamma then
-          gamma = dist_positive[i][1]
-          new_index = i
-        end
-        if dist_negative[i][1] > 0 and dist_negative[i][1] < gamma then
-          gamma = dist_negative[i][1]
-          new_index = i
-        end
-      end
-    end
-
-    recovering = false
-
-    if new_index == -1 then
-      print('Breaking due to some error.')
-      break
-    end
-
-    -- Lasso path modification, if specified
-    local subgamma = math.huge
-
-    inactive_indices = {}
-    if lasso_path then
-      for i=1,#active do
-        local weight = W[active[i]][1]
-        local delta = csign[active[i]][1] * w[i] * A
-        local candidate_subgamma = -weight / delta
-
-        if candidate_subgamma > 0 and candidate_subgamma < subgamma then
-          subgamma = candidate_subgamma
-          inactive_indices[active[i]] = true
-        elseif candidate_subgamma > 0 and candidate_subgamma < subgamma - epsilon then
-          inactive_indices[active[i]] = true
+    local gamma
+    if #active == inputs then
+      gamma = cmax / A
+    else
+      gamma = math.huge
+      for i=1,inputs do
+        if recovering or active_mask[i] == 0 then
+          if dist_positive[i][1] > 0 and dist_positive[i][1] < gamma then
+            gamma = dist_positive[i][1]
+          end
+          if dist_negative[i][1] > 0 and dist_negative[i][1] < gamma then
+            gamma = dist_negative[i][1]
+          end
         end
       end
-    end
 
-    if subgamma < gamma then
-      gamma = subgamma
-      recovering = true
+      recovering = false
+
+      if gamma == math.huge then
+        print('Breaking due to some error.')
+        break
+      end
+
+      -- Lasso path modification, if specified
+      local subgamma = math.huge
+
+      inactive_indices = {}
+      if lasso_path then
+        for i=1,#active do
+          local weight = W[active[i]][1]
+          local delta = csign[active[i]][1] * w[i] * A
+          local candidate_subgamma = -weight / delta
+
+          if candidate_subgamma > 0 and candidate_subgamma < subgamma then
+            subgamma = candidate_subgamma
+            inactive_indices[active[i]] = true
+          elseif candidate_subgamma > 0 and candidate_subgamma < subgamma - epsilon then
+            inactive_indices[active[i]] = true
+          end
+        end
+      end
+
+      if subgamma < gamma then
+        gamma = subgamma
+        recovering = true
+      end
     end
 
     -- Increase parameters by w * gamma
@@ -175,20 +189,6 @@ function lars(X, Y, total_weight, model_select, lasso_path)
     -- Decrease correlations by a * gamma
     c:csub(a:mul(gamma))
     cmax = cmax - A * gamma
-
-    --[[
-    if lasso_removal then
-      active_mask[active[index_to_remove] ] = 0
-      table.remove(active, index_to_remove)
-      just_removed = true
-    else
-      -- Add new variable to the active set
-      if active_mask[new_index] == 0 then
-        table.insert(active, new_index)
-        active_mask[new_index] = 1
-      end
-      just_removed = false
-    end]]
 
     -- Recompute actives
     active = {}
@@ -206,9 +206,8 @@ function lars(X, Y, total_weight, model_select, lasso_path)
       end
     end
 
-    print(#active)
-
     if Wabs:copy(W):abs():sum() > total_weight then
+      print('Breaking due to stopping condition')
       break
     end
   end
@@ -216,28 +215,43 @@ function lars(X, Y, total_weight, model_select, lasso_path)
   if model_select then
     return active
   else
-    return W:cmul(X_stdev:view(inputs, 1):expandAs(W))
+    return W:cdiv(X_stdev:view(inputs, 1):expandAs(W))
   end
 end
 
 -- TESTING
 
 local X_true = torch.CudaTensor(1000, 50):normal()
-local W_true = torch.CudaTensor(50, 1):zero()
+local W_true = torch.CudaTensor(50, 1):normal()
+local variance = 20
 
 for i=1,10 do
-  W_true[i]:fill(5) --normal()
+  W_true[i]:mul(10)
 end
 
 local Y_true = torch.CudaTensor(1000, 1):uniform()
-Y_true:addmm(10, Y_true, 1, X_true, W_true)
+Y_true:addmm(variance, Y_true, 1, X_true, W_true)
+--Y_true:add(-Y_true:mean())
 
 local ols = torch.inverse(X_true:t() * X_true) * X_true:t() * Y_true
-print('OLS:')
-print(ols)
+local lars_soln = lars(X_true, Y_true, 100, false, false)
+local lasso_soln = lars(X_true, Y_true, 100, false, true)
 
-print('LARS, 50:')
-print(lars(X_true, Y_true, 45, true, false))
+print('PREDICTORS: (true, ols, lars)')
+print(torch.cat(
+  {W_true, ols, lars_soln, lasso_soln}
+))
 
-print('LASSO, 50:')
-print(lars(X_true, Y_true, 45, true, true))
+local other_X = torch.CudaTensor(1000, 50):normal()
+local other_Y = torch.CudaTensor(1000, 1):uniform() * variance + other_X * W
+print('ERRORS (as unaccounted variance):')
+print(
+    math.sqrt((other_X * ols - other_Y):pow(2):mean()),
+    math.sqrt((other_X * lars_soln - other_Y):pow(2):mean()),
+    math.sqrt((other_X * lasso_soln - other_Y):pow(2):mean())
+)
+
+--[[
+print('')
+print(lars(X_true, Y_true, math.huge, false, true))
+]]
